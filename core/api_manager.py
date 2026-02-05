@@ -79,15 +79,70 @@ class APIManager:
         return None
 
     def clean_json_response(self, content: str) -> str:
-        """Helper to remove markdown from JSON responses."""
+        """
+        Enhanced JSON extraction with markdown fallback.
+        1. Try to find {...} JSON block
+        2. If not found, parse markdown bullet points into JSON
+        """
         if not content:
-            return ""
+            return "{}"
         
-        # 1. Try finding the first outer brace pair
-        # This regex looks for { followed by anything (non-greedy) until the last }
+        # 1. Try finding JSON block
         match = re.search(r'(\{.*\})', content, re.DOTALL)
         if match:
-             content = match.group(1)
+            return match.group(1).strip()
         
-        content = content.strip()
-        return content
+        # 2. Fallback: Parse markdown bullet points
+        # Pattern: * **Key:** Value or - **Key:** Value
+        result = {}
+        patterns = [
+            r'\*\s*\*\*([^:*]+)\*\*:\s*([^\n*]+)',  # * **Key:** Value
+            r'-\s*\*\*([^:*]+)\*\*:\s*([^\n-]+)',   # - **Key:** Value
+            r'\*\*([^:*]+)\*\*:\s*([^\n]+)',        # **Key:** Value
+        ]
+        
+        for pattern in patterns:
+            matches = re.findall(pattern, content)
+            for key, value in matches:
+                # Normalize key: "Download Mbps" -> "download_mbps"
+                norm_key = re.sub(r'[^a-zA-Z0-9]', '_', key.strip()).lower()
+                norm_key = re.sub(r'_+', '_', norm_key).strip('_')
+                
+                # Parse value
+                value = value.strip()
+                try:
+                    # Try numeric
+                    if '.' in value:
+                        result[norm_key] = float(value)
+                    else:
+                        result[norm_key] = int(value)
+                except ValueError:
+                    result[norm_key] = value if value.lower() != 'null' else None
+        
+        if result:
+            return json.dumps(result)
+        
+        return "{}"
+
+    def post_reasoning_completion(self, text_prompt: str, provider) -> Optional[str]:
+        """
+        Text-only reasoning call (no images).
+        Used for: parsing raw text → JSON, merging, validation.
+        """
+        payload = {
+            "model": provider.model,
+            "messages": [
+                {"role": "user", "content": text_prompt}
+            ],
+            "response_format": {"type": "json_object"},
+        }
+        
+        try:
+            resp = self.post_chat_completion(payload, provider=provider)
+            if resp and "choices" in resp:
+                content = resp["choices"][0]["message"]["content"]
+                return self.clean_json_response(content)
+        except Exception as e:
+            print(f"[REASONING] Error: {e}")
+        
+        return None
