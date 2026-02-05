@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import List, Dict
+from typing import List, Dict, Any
 from .config import ProcessingContext
 from .api_manager import APIManager
 from .file_handler import FileHandler
@@ -120,8 +120,8 @@ class Evaluator:
             else:
                  pass # Skip files that don't match pattern naming entirely
 
-        # 4. Rule 2 Verify (Updated for new split)
-        self.verify_completeness(model_service, model_speed) # Updated to take relevant models if needed
+        # 4. Rule 2 Verify
+        self.verify_completeness(provider_service, provider_speed)
 
         # 5. Map to Excel
         self.mapper.map_to_excel(xlsx_path)
