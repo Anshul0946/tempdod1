@@ -14,13 +14,15 @@ from core.mapper import Mapper
 from core.evaluator import Evaluator
 
 def main():
-    st.set_page_config(page_title="Cellular Processor (Dual-Model)", layout="wide")
+    st.set_page_config(page_title="Cellular Processor", layout="wide")
     st.title("🔬 Advanced Cellular Template Processor")
-    st.write("**Dual-Model Architecture** | Vision + Reasoning | Fault Tolerant")
+    st.write("**Dual-Model Pipeline** | Vision + Reasoning | No Nulls")
 
     # Session State Init
     if "context" not in st.session_state:
         st.session_state.context = ProcessingContext()
+    if "last_log_count" not in st.session_state:
+        st.session_state.last_log_count = 0
     
     # Sidebar
     st.sidebar.header("🔑 API Configuration")
@@ -37,6 +39,7 @@ def main():
 
     if st.sidebar.button("🔄 Reset State"):
         st.session_state.context = ProcessingContext()
+        st.session_state.last_log_count = 0
         st.rerun()
 
     # Main Area
@@ -45,20 +48,20 @@ def main():
         
         st.subheader("⚙️ Model Configuration")
         
-        # Two main models
         col1, col2 = st.columns(2)
         
         with col1:
-            st.markdown("**👁️ Vision Model** (Image Text Extraction)")
+            st.markdown("**👁️ Vision Model** (OCR)")
             vision_model = st.text_input("Vision Model", value=VISION_MODEL_DEFAULT, key="vision_m")
-            st.caption("Reads raw text from images")
             
         with col2:
-            st.markdown("**🧠 Reasoning Model** (JSON Parsing & Validation)")
+            st.markdown("**🧠 Reasoning Model** (JSON Parsing)")
             reasoning_model = st.text_input("Reasoning Model", value=REASONING_MODEL_DEFAULT, key="reason_m")
-            st.caption("Structures text into JSON, handles merging")
 
         # Create providers
+        provider_vision = None
+        provider_reasoning = None
+        
         if st.session_state.get("token"):
             provider_vision = LLMProvider(
                 name="Vision",
@@ -74,7 +77,7 @@ def main():
                 base_url=API_BASE
             )
 
-        if uploaded_file:
+        if uploaded_file and provider_vision and provider_reasoning:
             if st.button("🚀 Start Processing", type="primary"):
                 # Setup
                 temp_dir = tempfile.mkdtemp()
@@ -82,12 +85,10 @@ def main():
                 with open(file_path, "wb") as f:
                     f.write(uploaded_file.getbuffer())
 
-                # Initialization
+                # Create fresh context
                 ctx = ProcessingContext()
-                ctx.log("=" * 50)
-                ctx.log("INITIALIZING DUAL-MODEL PIPELINE")
-                ctx.log("=" * 50)
                 st.session_state.context = ctx
+                st.session_state.last_log_count = 0
 
                 api_mgr = APIManager(st.session_state.token)
                 file_handler = FileHandler(ctx)
@@ -97,53 +98,55 @@ def main():
                 mapper = Mapper(ctx, api_mgr)
                 evaluator = Evaluator(ctx, api_mgr, file_handler, extractor, mapper)
 
-                # Execution
-                progress_bar = st.progress(0)
-                status_text = st.empty()
+                # Live log display
+                log_container = st.empty()
+                status_container = st.empty()
                 
-                with st.spinner("Processing with Dual-Model Pipeline..."):
-                    try:
-                        status_text.text("Stage 1: Extracting images from Excel...")
-                        progress_bar.progress(10)
-                        
-                        out_path = evaluator.process_workflow(
-                            file_path, 
-                            provider_vision,
-                            provider_reasoning
-                        )
-                        
-                        progress_bar.progress(100)
-                        status_text.text("Complete!")
-                        
-                        if out_path:
-                            st.success("✅ Processing Complete!")
-                            with open(out_path, "rb") as f:
-                                st.download_button(
-                                    "📥 Download Result", 
-                                    f, 
-                                    file_name="processed_output.xlsx",
-                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                                )
-                    except Exception as e:
-                        st.error(f"❌ Critical Error: {e}")
-                        ctx.log(f"CRITICAL ERROR: {e}")
-                        import traceback
-                        ctx.log(traceback.format_exc())
+                status_container.info("🔄 Processing... Please wait")
+                
+                try:
+                    # Run workflow
+                    out_path = evaluator.process_workflow(
+                        file_path, 
+                        provider_vision,
+                        provider_reasoning
+                    )
+                    
+                    status_container.success("✅ Processing Complete!")
+                    
+                    if out_path:
+                        with open(out_path, "rb") as f:
+                            st.download_button(
+                                "📥 Download Result", 
+                                f, 
+                                file_name="processed_output.xlsx",
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                            )
+                except Exception as e:
+                    status_container.error(f"❌ Error: {e}")
+                    ctx.log(f"CRITICAL ERROR: {e}")
+                    import traceback
+                    ctx.log(traceback.format_exc())
 
-    # Logs Section
+    # Logs Section - Always visible
     st.markdown("---")
-    st.subheader("📋 Live Logs")
+    st.subheader("📋 Processing Logs")
     
-    # Add filter
     log_filter = st.selectbox("Filter", ["All", "Errors Only", "Success Only"], index=0)
     
     logs = st.session_state.context.logs
     if log_filter == "Errors Only":
         logs = [l for l in logs if "ERROR" in l or "WARN" in l]
     elif log_filter == "Success Only":
-        logs = [l for l in logs if "SUCCESS" in l]
+        logs = [l for l in logs if "OK" in l or "SUCCESS" in l]
     
-    st.text_area("Logs", value="\n".join(logs), height=400)
+    # Show logs
+    log_text = "\n".join(logs) if logs else "No logs yet. Upload a file and start processing."
+    st.text_area("Logs", value=log_text, height=400, key="log_display")
+    
+    # Auto-refresh hint
+    if logs:
+        st.caption(f"📊 Total: {len(st.session_state.context.logs)} log entries")
 
 if __name__ == "__main__":
     main()
