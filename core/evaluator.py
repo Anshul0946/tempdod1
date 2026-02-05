@@ -50,9 +50,11 @@ class Evaluator:
         # self.mapper.map_to_excel(path) -> check for NULLs -> ask AI -> update.
         pass
 
-    def process_workflow(self, xlsx_path: str, model_service: str, model_generic: str) -> str:
+    def process_workflow(self, xlsx_path: str, provider_service: Any, provider_speed: Any, provider_video: Any, provider_voice: Any) -> str:
         """
-        Main orchestration pipeline.
+        Main orchestration pipeline with Deterministic Routing.
+        Accepts LLMProvider objects (typed as Any to avoid circular imports if config is tricky, 
+        but ideally Typed from config).
         """
         # 1. Extract Images
         images = self.file_handler.extract_images_from_excel(xlsx_path)
@@ -60,43 +62,68 @@ class Evaluator:
             self.context.log("[ERROR] No images found.")
             return None
 
-        # 2. Process Service Images (Alpha, Beta, Gamma)
+        # 2. Process Service Images (Alpha, Beta, Gamma) - Images 1 & 2
         for sector in ["alpha", "beta", "gamma"]:
             img1 = self.file_handler.get_image_path(f"{sector}_image_1")
             img2 = self.file_handler.get_image_path(f"{sector}_image_2")
             
             if img1 and img2:
-                data = self.extractor.analyze_service_images(sector, img1, img2, model_service)
+                data = self.extractor.analyze_service_images(sector, img1, img2, provider_service)
                 if data:
                     setattr(self.context, f"{sector}_service", data)
                     self.context.log(f"[SUCCESS] {sector} service data extracted.")
 
-        # 3. Process Generic Images (Speed, Video, Voice)
-        # We iterate all extracted images and check those that aren't service images
+        # 3. Process Generic Images (Speed, Video, Voice) with Deterministic Routing
         for img_path in images:
             name = Path(img_path).stem
-            if "_image_1" in name or "_image_2" in name: 
-                 if "speedtest" not in name and "voicetest" not in name:
-                     continue # Skip service images we already handled
+            # Parse sector and suffix
+            # Expected format: "{sector}_image_{number}" or "voicetest_image_{number}"
+            
+            parts = name.split("_")
+            # FIX: Edge case where split produces fewer parts than expected
+            if len(parts) >= 3 and parts[1] == "image":
+                sector = parts[0]
+                try:
+                    suffix = int(parts[2])
+                except ValueError:
+                    self.context.log(f"[WARN] Could not parse number from {name}")
+                    continue 
 
-            result = self.extractor.analyze_generic_image(img_path, model_generic)
-            img_type = result.get("image_type")
-            data = result.get("data")
+                # ----------------- ROUTING LOGIC -----------------
+                # Voice Pipeline
+                if sector == "voicetest":
+                    data = self.extractor.analyze_voice_call(img_path, provider_voice)
+                    if data:
+                        self.context.voice_test[name] = data
+                    continue
 
-            # Store in context based on naming convention (heuristic)
-            if img_type and data:
-                 sector_prefix = name.split("_")[0] # alpha, beta, gamma
-                 if img_type == "speed_test":
-                     getattr(self.context, f"{sector_prefix}_speedtest")[name] = data
-                 elif img_type == "video_test":
-                     getattr(self.context, f"{sector_prefix}_video")[name] = data
-                 elif img_type == "voice_call":
-                     self.context.voice_test[name] = data
+                # Service Pipeline (Already handled above)
+                if suffix == 1 or suffix == 2:
+                    continue
 
-        # 4. Rule 2 Verify
-        self.verify_completeness(model_service, model_generic)
+                # Speed Pipeline (Images 3-7)
+                if 3 <= suffix <= 7:
+                    data = self.extractor.analyze_speed_test(img_path, provider_speed)
+                    if data:
+                         getattr(self.context, f"{sector}_speedtest")[name] = data
+                    continue
 
-        # 5. Map to Excel (Rule 3 included in logic)
+                # Video Pipeline (Image 8)
+                if suffix == 8:
+                    data = self.extractor.analyze_video_test(img_path, provider_video)
+                    if data:
+                        getattr(self.context, f"{sector}_video")[name] = data
+                    continue
+                
+                # Unknown/Extra Images
+                self.context.log(f"[WARN] Image {name} did not match any pipeline (Suffix {suffix}). Skipping.")
+            else:
+                 pass # Skip files that don't match pattern naming entirely
+
+        # 4. Rule 2 Verify (Updated for new split)
+        self.verify_completeness(model_service, model_speed) # Updated to take relevant models if needed
+
+        # 5. Map to Excel
         self.mapper.map_to_excel(xlsx_path)
         
         return xlsx_path
