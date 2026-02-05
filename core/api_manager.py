@@ -1,7 +1,7 @@
 import requests
 import json
 import time
-from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
+import re
 from typing import Dict, Optional, Any
 from .config import API_BASE
 
@@ -24,33 +24,70 @@ class APIManager:
             return False
         return True
 
-    @retry(stop=stop_after_attempt(3), wait=wait_fixed(2), 
-           retry=retry_if_exception_type((requests.exceptions.Timeout, requests.exceptions.ConnectionError)))
-    def post_chat_completion(self, payload: Dict[str, Any], timeout: int = 60) -> Optional[Dict[str, Any]]:
+    def post_chat_completion(self, payload: Dict[str, Any], provider = None) -> Optional[Dict[str, Any]]:
         """
-        Robust API call with retries.
+        Robust API call with manual double-timeout logic.
+        Attempt 1: 60s timeout.
+        Attempt 2: 120s timeout.
+        
+        provider: Optional[LLMProvider] - If provided, uses this provider's URL and Key.
+                  Otherwise uses the default token and API_BASE.
         """
-        url = f"{API_BASE}/chat/completions"
-        try:
-            response = requests.post(url, headers=self.headers, json=payload, timeout=timeout)
-            response.raise_for_status()
-            return response.json()
-        except requests.exceptions.HTTPError as e:
-            # Don't retry 4xx errors (client error), but let 5xx (server error) retry or raise
-            if 400 <= e.response.status_code < 500:
-                print(f"API Client Error: {e}")
-                return None
-            raise e
-        except Exception as e:
-             raise e # Allow tenacity to catch it
+        
+        # Determine URL and Headers based on provider override
+        if provider:
+            url = f"{provider.base_url}/chat/completions"
+            headers = {
+                "Authorization": f"Bearer {provider.api_key}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "http://localhost",
+                "X-Title": "Cellular Processor",
+            }
+        else:
+            url = f"{API_BASE}/chat/completions"
+            headers = self.headers
+
+        timeouts = [60, 120]
+        
+        for i, timeout in enumerate(timeouts):
+            try:
+                response = requests.post(url, headers=headers, json=payload, timeout=timeout)
+                response.raise_for_status()
+                return response.json()
+            except requests.exceptions.HTTPError as e:
+                # 4xx errors are likely client errors, do not retry unless 408/429?
+                # For simplicity, if it's 400-499, we fail immediately (except 429)
+                if 400 <= e.response.status_code < 500 and e.response.status_code != 429:
+                    print(f"[API] Client Error {e.response.status_code}: {e}")
+                    raise e # Let caller handle logic error
+                
+                print(f"[API] HTTP Error {e} (Attempt {i+1})")
+                if i < len(timeouts) - 1:
+                    time.sleep(2)
+                    continue
+                raise e
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+                print(f"[API] Network Error: {e} (Attempt {i+1})")
+                if i < len(timeouts) - 1:
+                    print(f"[API] Retrying with extended timeout ({timeouts[i+1]}s)...")
+                    time.sleep(2)
+                    continue
+                raise e # Final failure
+            except Exception as e:
+                raise e # Unexpected error
+
+        return None
 
     def clean_json_response(self, content: str) -> str:
         """Helper to remove markdown from JSON responses."""
         if not content:
             return ""
+        
+        # 1. Try finding the first outer brace pair
+        # This regex looks for { followed by anything (non-greedy) until the last }
+        match = re.search(r'(\{.*\})', content, re.DOTALL)
+        if match:
+             content = match.group(1)
+        
         content = content.strip()
-        if content.startswith("```"):
-            import re
-            content = re.sub(r'^```(?:json)?\s*\n?', '', content)
-            content = re.sub(r'\n?```\s*$', '', content)
-        return content.strip()
+        return content
