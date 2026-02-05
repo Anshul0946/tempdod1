@@ -9,7 +9,7 @@ API_BASE = "https://integrate.api.nvidia.com/v1"
 # ----------------- PROVIDER CONFIG -----------------
 class LLMProvider(BaseModel):
     name: str = "Default"
-    base_url: str = API_BASE
+    base_url: str = "https://integrate.api.nvidia.com/v1"
     api_key: str
     model: str
 
