@@ -96,15 +96,19 @@ class Extractor:
         """
         Try to parse JSON locally without API call.
         Returns schema object if successful, None if needs reasoning API.
+        
+        STRICT: Any null value triggers full Reasoning pipeline.
         """
         try:
             if not json_str or json_str == "{}":
                 return None
             data = json.loads(json_str)
-            # Validate: if too many nulls, might need reasoning
-            null_count = sum(1 for v in data.values() if v is None)
-            if null_count > len(data) * 0.7:  # >70% nulls = probably bad parse
-                return None
+            
+            # STRICT CHECK: If ANY value is null, trigger reasoning
+            has_null = any(v is None for v in data.values())
+            if has_null:
+                return None  # Force reasoning API call
+            
             return schema_cls(**data)
         except:
             return None
@@ -163,29 +167,44 @@ class Extractor:
     def _smart_extract(self, image_path: str, vision_provider: LLMProvider, reasoning_provider: LLMProvider,
                        vision_prompt: str, reasoning_prompt: str, schema_json: dict, schema_cls):
         """
-        Smart extraction with API call optimization:
-        1. Extract with Vision
-        2. Try local parse of response (using markdown fallback)
-        3. Only call Reasoning if local parse fails
+        Smart extraction with retry logic:
+        1. Vision extracts with schema-aware prompt
+        2. Try local parse
+        3. If nulls found → Re-run Vision as pure OCR → Reasoning parses
         """
         name = Path(image_path).stem
         
-        # Stage 1: Vision extraction
+        # Stage 1: Vision extraction with schema-aware prompt
         raw_text = self._extract_raw_text(image_path, vision_provider, vision_prompt)
         if not raw_text:
             return None
         
-        # Optimization: Try local parse first (using markdown fallback in clean_json_response)
+        # Try local parse
         local_json = self.api.clean_json_response(raw_text)
         local_result = self._try_local_parse(local_json, schema_cls)
         
         if local_result:
-            self.context.log(f"[OPTIMIZED] {name}: Parsed locally, skipped Reasoning API call")
+            self.context.log(f"[SUCCESS] {name}: All values extracted, no nulls")
             return local_result
         
-        # Stage 2: Reasoning API (only if local parse failed)
-        self.context.log(f"[REASONING] {name}: Local parse failed, calling Reasoning API")
-        return self._parse_with_reasoning(raw_text, schema_json, schema_cls, reasoning_provider, reasoning_prompt)
+        # ===== RETRY: Vision found nulls, re-extract as pure OCR =====
+        self.context.log(f"[RETRY] {name}: Nulls detected, re-analyzing with OCR mode...")
+        
+        # Pure OCR prompt - just read all text, no schema
+        ocr_prompt = (
+            "You are an OCR assistant. Read and extract ALL text visible in this image. "
+            "Return every piece of text you can see, including numbers, labels, and values. "
+            "Do not interpret or structure the data, just read everything."
+        )
+        
+        ocr_text = self._extract_raw_text(image_path, vision_provider, ocr_prompt)
+        if not ocr_text:
+            self.context.log(f"[WARN] {name}: OCR retry also failed")
+            return None
+        
+        # Stage 2: Reasoning parses the OCR text
+        self.context.log(f"[REASONING] {name}: Parsing OCR text with reasoning model...")
+        return self._parse_with_reasoning(ocr_text, schema_json, schema_cls, reasoning_provider, reasoning_prompt)
 
     # ==================== SERVICE ANALYSIS (2 IMAGES → 1 SCHEMA) ====================
     def analyze_service_images(
