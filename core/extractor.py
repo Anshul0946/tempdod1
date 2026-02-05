@@ -1,5 +1,6 @@
 import base64
 import json
+import time
 from pathlib import Path
 from typing import Optional, Dict, Any
 from .config import (
@@ -8,7 +9,77 @@ from .config import (
 )
 from .api_manager import APIManager
 
+# ==================== DOMAIN-SPECIFIC PROMPTS ====================
+# These prompts are crafted for telecommunications expertise
+
+PROMPT_VISION_SERVICE = """You are an expert telecommunications network engineer.
+Read ALL text visible in this cellular service mode screenshot.
+Focus on extracting these network parameters:
+- 5G NR: ARFCN, Band, PCI, Bandwidth, RSRP, RSRQ, SINR
+- 4G LTE: EARFCN, Band, PCI, Bandwidth, RSRP, RSRQ, SINR
+Return the raw text exactly as displayed. Do NOT interpret values."""
+
+PROMPT_VISION_SPEED = """You are a network performance analyst.
+Read ALL text from this speed test screenshot.
+Focus on: Download speed (Mbps), Upload speed (Mbps), Ping/Latency (ms), Jitter (ms).
+Return raw text exactly as displayed."""
+
+PROMPT_VISION_VIDEO = """You are a streaming quality analyst.
+Read ALL text from this video streaming test screenshot.
+Focus on: Maximum resolution, Load time, Buffering percentage.
+Return raw text exactly as displayed."""
+
+PROMPT_VISION_VOICE = """You are a voice quality analyst.
+Read ALL text from this VoLTE/voice call screenshot.
+Focus on: Phone number, Call duration, Call status, Time of call.
+Return raw text exactly as displayed."""
+
+PROMPT_REASONING_SERVICE = """You are an expert 5G/LTE cellular network engineer with deep knowledge of:
+- 5G NR parameters: ARFCN (frequency), Band (n77/n78/etc), PCI (cell ID), Bandwidth, RSRP/RSRQ/SINR (signal quality)
+- 4G LTE parameters: EARFCN, Band, PCI, Bandwidth, RSRP/RSRQ/SINR
+
+Parse the following raw text into JSON matching the schema EXACTLY.
+Rules:
+- Extract numeric values only (no units like 'dBm' or 'MHz')
+- RSRP is typically negative (-50 to -140 dBm)
+- SINR can be positive or negative
+- Use null ONLY if value is truly not present
+- Do NOT hallucinate or guess values
+
+Return ONLY the JSON object, no explanation."""
+
+PROMPT_REASONING_SPEED = """You are a network performance expert.
+Parse this speed test data into JSON matching the schema EXACTLY.
+Rules:
+- Download/Upload in Mbps (numeric only)
+- Ping/Jitter in ms (numeric only)
+- Use null if not found
+Return ONLY the JSON object."""
+
+PROMPT_REASONING_VIDEO = """You are a streaming quality expert.
+Parse this video test data into JSON matching the schema EXACTLY.
+Rules:
+- Resolution as string (e.g., "1080p", "4K")
+- Load time in ms
+- Buffering as percentage (0-100)
+Return ONLY the JSON object."""
+
+PROMPT_REASONING_VOICE = """You are a voice call quality expert.
+Parse this call data into JSON matching the schema EXACTLY.
+Rules:
+- Phone number as string with formatting
+- Duration in seconds (convert if needed)
+- Status as string (Connected, Failed, etc.)
+- Time as string in original format
+Return ONLY the JSON object."""
+
+
 class Extractor:
+    """
+    Two-Stage Extraction Pipeline with API Call Optimization:
+    1. Try local parsing first (no API call)
+    2. If fails, use Vision → Reasoning pipeline
+    """
     def __init__(self, api_manager: APIManager, context: ProcessingContext):
         self.api = api_manager
         self.context = context
@@ -21,91 +92,35 @@ class Extractor:
             self.context.log(f"[ERROR] Could not read image {path}: {e}")
             return None
 
-    def analyze_service_images(self, sector: str, img1_path: str, img2_path: str, provider: LLMProvider) -> Optional[ServiceData]:
-        self.context.log(f"[AI] Analyzing Service Data for {sector} using {provider.name}...")
-        b1 = self._encode_image(img1_path)
-        b2 = self._encode_image(img2_path)
-        if not b1 or not b2:
+    def _try_local_parse(self, json_str: str, schema_cls):
+        """
+        Try to parse JSON locally without API call.
+        Returns schema object if successful, None if needs reasoning API.
+        """
+        try:
+            if not json_str or json_str == "{}":
+                return None
+            data = json.loads(json_str)
+            # Validate: if too many nulls, might need reasoning
+            null_count = sum(1 for v in data.values() if v is None)
+            if null_count > len(data) * 0.7:  # >70% nulls = probably bad parse
+                return None
+            return schema_cls(**data)
+        except:
             return None
 
-        prompt = (
-            "You are a hyper-specialized AI for cellular network engineering data analysis. "
-            "Analyze both provided service-mode screenshots carefully and return exactly one JSON object "
-            "matching the schema. Use null where value is not found.\n\n"
-            f"SCHEMA:\n{json.dumps(SERVICE_SCHEMA_JSON, indent=2)}"
-        )
+    # ==================== STAGE 1: RAW TEXT EXTRACTION ====================
+    def _extract_raw_text(self, image_path: str, vision_provider: LLMProvider, prompt: str) -> Optional[str]:
+        """Vision model reads text from image with domain-specific prompt."""
+        name = Path(image_path).stem
+        self.context.log(f"[VISION] Extracting text from {name}...")
+        
+        b64_img = self._encode_image(image_path)
+        if not b64_img:
+            return None
 
         payload = {
-            "model": provider.model,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b1}"}},
-                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b2}"}},
-                    ],
-                }
-            ],
-            "response_format": {"type": "json_object"},
-        }
-
-        try:
-            resp = self.api.post_chat_completion(payload, provider=provider)
-            if resp:
-                content = self.api.clean_json_response(resp["choices"][0]["message"]["content"])
-                try:
-                    data_dict = json.loads(content)
-                    return ServiceData(**data_dict)
-                except Exception as e:
-                    self.context.log(f"[ERROR] Failed to parse Service Data for {sector}: {e}")
-                    self.context.log(f"[DEBUG] Raw Content: {content}")
-            else:
-                self.context.log(f"[ERROR] API Request failed for {sector} service data.")
-        except Exception as e:
-            self.context.log(f"[ERROR] Exception during Service Analysis for {sector}: {e}")
-            
-        return None
-
-    def analyze_speed_test(self, image_path: str, provider: LLMProvider) -> Optional[SpeedTestData]:
-        name = Path(image_path).stem
-        self.context.log(f"[AI] Analyzing Speed Test Data: {name} using {provider.name}")
-        b = self._encode_image(image_path)
-        if not b: return None
-
-        prompt = (
-            "Extract Speed Test data from this screenshot. Return strict JSON matching the schema.\n"
-            f"SCHEMA:\n{json.dumps(SPEED_SCHEMA_JSON, indent=2)}"
-        )
-        return self._run_single_image_analysis(name, b, prompt, provider, SpeedTestData)
-
-    def analyze_video_test(self, image_path: str, provider: LLMProvider) -> Optional[VideoTestData]:
-        name = Path(image_path).stem
-        self.context.log(f"[AI] Analyzing Video Test Data: {name} using {provider.name}")
-        b = self._encode_image(image_path)
-        if not b: return None
-
-        prompt = (
-            "Extract Video Test data from this screenshot. Return strict JSON matching the schema.\n"
-            f"SCHEMA:\n{json.dumps(VIDEO_SCHEMA_JSON, indent=2)}"
-        )
-        return self._run_single_image_analysis(name, b, prompt, provider, VideoTestData)
-
-    def analyze_voice_call(self, image_path: str, provider: LLMProvider) -> Optional[VoiceCallData]:
-        name = Path(image_path).stem
-        self.context.log(f"[AI] Analyzing Voice Call Data: {name} using {provider.name}")
-        b = self._encode_image(image_path)
-        if not b: return None
-
-        prompt = (
-            "Extract Voice Call data from this screenshot. Return strict JSON matching the schema.\n"
-            f"SCHEMA:\n{json.dumps(VOICE_SCHEMA_JSON, indent=2)}"
-        )
-        return self._run_single_image_analysis(name, b, prompt, provider, VoiceCallData)
-
-    def _run_single_image_analysis(self, name: str, b64_img: str, prompt: str, provider: LLMProvider, schema_cls):
-        payload = {
-            "model": provider.model,
+            "model": vision_provider.model,
             "messages": [
                 {
                     "role": "user",
@@ -115,22 +130,114 @@ class Extractor:
                     ],
                 }
             ],
-            "response_format": {"type": "json_object"},
         }
+
+        try:
+            resp = self.api.post_chat_completion(payload, provider=vision_provider)
+            if resp and "choices" in resp:
+                raw_text = resp["choices"][0]["message"]["content"]
+                self.context.log(f"[VISION] Got {len(raw_text)} chars from {name}")
+                return raw_text
+        except Exception as e:
+            self.context.log(f"[VISION ERROR] {name}: {e}")
+        
+        return None
+
+    # ==================== STAGE 2: REASONING PARSE ====================
+    def _parse_with_reasoning(self, raw_text: str, schema_json: dict, schema_cls, reasoning_provider: LLMProvider, prompt_template: str):
+        """Reasoning model parses raw text into structured JSON."""
+        self.context.log(f"[REASONING] Parsing extracted text...")
+        
+        prompt = f"{prompt_template}\n\nSCHEMA:\n{json.dumps(schema_json, indent=2)}\n\nRAW TEXT:\n{raw_text}"
         
         try:
-            resp = self.api.post_chat_completion(payload, provider=provider)
-            if resp:
-                content = self.api.clean_json_response(resp["choices"][0]["message"]["content"])
-                try:
-                    data = json.loads(content)
-                    return schema_cls(**data)
-                except Exception as e:
-                    self.context.log(f"[ERROR] JSON Parse Error for {name}: {e}")
-                    self.context.log(f"[DEBUG] Raw Content: {content}")
-            else:
-                 self.context.log(f"[ERROR] API Request failed for {name}")
+            json_str = self.api.post_reasoning_completion(prompt, reasoning_provider)
+            if json_str:
+                data = json.loads(json_str)
+                return schema_cls(**data)
         except Exception as e:
-            self.context.log(f"[ERROR] Exception during analysis of {name}: {e}")
-            
+            self.context.log(f"[REASONING ERROR] Parse failed: {e}")
+        
         return None
+
+    def _smart_extract(self, image_path: str, vision_provider: LLMProvider, reasoning_provider: LLMProvider,
+                       vision_prompt: str, reasoning_prompt: str, schema_json: dict, schema_cls):
+        """
+        Smart extraction with API call optimization:
+        1. Extract with Vision
+        2. Try local parse of response (using markdown fallback)
+        3. Only call Reasoning if local parse fails
+        """
+        name = Path(image_path).stem
+        
+        # Stage 1: Vision extraction
+        raw_text = self._extract_raw_text(image_path, vision_provider, vision_prompt)
+        if not raw_text:
+            return None
+        
+        # Optimization: Try local parse first (using markdown fallback in clean_json_response)
+        local_json = self.api.clean_json_response(raw_text)
+        local_result = self._try_local_parse(local_json, schema_cls)
+        
+        if local_result:
+            self.context.log(f"[OPTIMIZED] {name}: Parsed locally, skipped Reasoning API call")
+            return local_result
+        
+        # Stage 2: Reasoning API (only if local parse failed)
+        self.context.log(f"[REASONING] {name}: Local parse failed, calling Reasoning API")
+        return self._parse_with_reasoning(raw_text, schema_json, schema_cls, reasoning_provider, reasoning_prompt)
+
+    # ==================== SERVICE ANALYSIS (2 IMAGES → 1 SCHEMA) ====================
+    def analyze_service_images(
+        self, 
+        sector: str, 
+        img1_path: str, 
+        img2_path: str, 
+        vision_provider: LLMProvider,
+        reasoning_provider: LLMProvider
+    ) -> Optional[ServiceData]:
+        """Service analysis: extract from both images, merge with reasoning."""
+        self.context.log(f"[SERVICE] Processing {sector} (2 images)...")
+        
+        # Stage 1: Extract from both images
+        text1 = self._extract_raw_text(img1_path, vision_provider, PROMPT_VISION_SERVICE)
+        time.sleep(0.5)
+        text2 = self._extract_raw_text(img2_path, vision_provider, PROMPT_VISION_SERVICE)
+        
+        if not text1 and not text2:
+            self.context.log(f"[SERVICE ERROR] No text extracted for {sector}")
+            return None
+        
+        # Combine and parse with reasoning (service needs merging, can't skip)
+        combined = f"=== IMAGE 1 (Network Info) ===\n{text1 or 'No data'}\n\n=== IMAGE 2 (Signal Quality) ===\n{text2 or 'No data'}"
+        
+        result = self._parse_with_reasoning(combined, SERVICE_SCHEMA_JSON, ServiceData, reasoning_provider, PROMPT_REASONING_SERVICE)
+        
+        if result:
+            self.context.log(f"[SERVICE OK] {sector} extracted successfully")
+        
+        return result
+
+    # ==================== SPEED TEST ====================
+    def analyze_speed_test(self, image_path: str, vision_provider: LLMProvider, reasoning_provider: LLMProvider) -> Optional[SpeedTestData]:
+        return self._smart_extract(
+            image_path, vision_provider, reasoning_provider,
+            PROMPT_VISION_SPEED, PROMPT_REASONING_SPEED,
+            SPEED_SCHEMA_JSON, SpeedTestData
+        )
+
+    # ==================== VIDEO TEST ====================
+    def analyze_video_test(self, image_path: str, vision_provider: LLMProvider, reasoning_provider: LLMProvider) -> Optional[VideoTestData]:
+        return self._smart_extract(
+            image_path, vision_provider, reasoning_provider,
+            PROMPT_VISION_VIDEO, PROMPT_REASONING_VIDEO,
+            VIDEO_SCHEMA_JSON, VideoTestData
+        )
+
+    # ==================== VOICE CALL ====================
+    def analyze_voice_call(self, image_path: str, vision_provider: LLMProvider, reasoning_provider: LLMProvider) -> Optional[VoiceCallData]:
+        return self._smart_extract(
+            image_path, vision_provider, reasoning_provider,
+            PROMPT_VISION_VOICE, PROMPT_REASONING_VOICE,
+            VOICE_SCHEMA_JSON, VoiceCallData
+        )
