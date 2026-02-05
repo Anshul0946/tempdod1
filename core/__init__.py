@@ -1,7 +1,7 @@
 # Core module - all exports
 from .config import (
     ProcessingContext, API_BASE, LLMProvider,
-    VISION_MODEL_DEFAULT, REASONING_MODEL_DEFAULT,
+    VISION_MODEL_DEFAULT, REASONING_MODEL_DEFAULT, OCR_URL,
     ServiceData, SpeedTestData, VideoTestData, VoiceCallData,
     SERVICE_SCHEMA_JSON, SPEED_SCHEMA_JSON, VIDEO_SCHEMA_JSON, VOICE_SCHEMA_JSON
 )
