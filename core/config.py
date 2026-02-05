@@ -5,8 +5,14 @@ import streamlit as st
 
 # ----------------- CONSTANTS -----------------
 API_BASE = "https://integrate.api.nvidia.com/v1"
-MODEL_SERVICE_DEFAULT = "meta/llama-3.2-90b-vision-instruct"
-MODEL_GENERIC_DEFAULT = "meta/llama-3.2-90b-vision-instruct"
+
+# ----------------- PROVIDER CONFIG -----------------
+class LLMProvider(BaseModel):
+    name: str = "Default"
+    base_url: str = API_BASE
+    api_key: str
+    model: str
+
 
 # ----------------- SCHEMAS -----------------
 # Strict Pydantic models to prevent hallucinations
@@ -104,8 +110,4 @@ SPEED_SCHEMA_JSON = SpeedTestData.model_json_schema()['properties']
 VIDEO_SCHEMA_JSON = VideoTestData.model_json_schema()['properties']
 VOICE_SCHEMA_JSON = VoiceCallData.model_json_schema()['properties']
 
-GENERIC_SCHEMAS = {
-    "speed_test": {"image_type": "speed_test", "data": SPEED_SCHEMA_JSON},
-    "video_test": {"image_type": "video_test", "data": VIDEO_SCHEMA_JSON},
-    "voice_call": {"image_type": "voice_call", "data": VOICE_SCHEMA_JSON},
-}
+
