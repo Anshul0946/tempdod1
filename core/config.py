@@ -5,6 +5,8 @@ import streamlit as st
 
 # ----------------- CONSTANTS -----------------
 API_BASE = "https://integrate.api.nvidia.com/v1"
+REASONING_MODEL_DEFAULT = "deepseek-ai/deepseek-v3.2"
+VISION_MODEL_DEFAULT = "meta/llama-3.2-90b-vision-instruct"
 
 # ----------------- PROVIDER CONFIG -----------------
 class LLMProvider(BaseModel):
