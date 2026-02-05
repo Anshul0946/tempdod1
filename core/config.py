@@ -5,8 +5,9 @@ import streamlit as st
 
 # ----------------- CONSTANTS -----------------
 API_BASE = "https://integrate.api.nvidia.com/v1"
+OCR_URL = "https://ai.api.nvidia.com/v1/cv/baidu/paddleocr"
 REASONING_MODEL_DEFAULT = "deepseek-ai/deepseek-v3.2"
-VISION_MODEL_DEFAULT = "meta/llama-3.2-90b-vision-instruct"
+VISION_MODEL_DEFAULT = "meta/llama-3.2-90b-vision-instruct"  # Kept for reference
 
 # ----------------- PROVIDER CONFIG -----------------
 class LLMProvider(BaseModel):
