@@ -121,21 +121,23 @@ class Extractor:
             resp.raise_for_status()
             data = resp.json()
             
-            # Extract text from PaddleOCR response
-            # Response format: {"data": [{"text": [...]}]}
-            if "data" in data and data["data"]:
-                texts = []
+            # Correct parsing: data[].text_detections[].text_prediction.text
+            texts = []
+            if "data" in data:
                 for item in data["data"]:
-                    if isinstance(item, dict) and "text" in item:
-                        texts.extend(item["text"])
-                    elif isinstance(item, list):
-                        texts.extend(item)
-                
-                ocr_text = " ".join(str(t) for t in texts if t)
-                self.context.log(f"[OCR] Got {len(ocr_text)} chars")
+                    if "text_detections" in item:
+                        for detection in item["text_detections"]:
+                            if "text_prediction" in detection:
+                                text = detection["text_prediction"].get("text", "")
+                                if text:
+                                    texts.append(text)
+            
+            if texts:
+                ocr_text = "\n".join(texts)
+                self.context.log(f"[OCR] Got {len(ocr_text)} chars ({len(texts)} lines)")
                 return ocr_text
             else:
-                self.context.log(f"[OCR] No text found in response")
+                self.context.log(f"[OCR] No text found")
                 return None
                 
         except Exception as e:
