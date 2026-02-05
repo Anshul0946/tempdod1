@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Optional, Dict, Any
 from .config import (
     ProcessingContext, ServiceData, SpeedTestData, VideoTestData, VoiceCallData,
-    SERVICE_SCHEMA_JSON, GENERIC_SCHEMAS
+    SERVICE_SCHEMA_JSON, SPEED_SCHEMA_JSON, VIDEO_SCHEMA_JSON, VOICE_SCHEMA_JSON, LLMProvider
 )
 from .api_manager import APIManager
 
@@ -21,8 +21,8 @@ class Extractor:
             self.context.log(f"[ERROR] Could not read image {path}: {e}")
             return None
 
-    def analyze_service_images(self, sector: str, img1_path: str, img2_path: str, model_name: str) -> Optional[ServiceData]:
-        self.context.log(f"[AI] Analyzing Service Data for {sector}...")
+    def analyze_service_images(self, sector: str, img1_path: str, img2_path: str, provider: LLMProvider) -> Optional[ServiceData]:
+        self.context.log(f"[AI] Analyzing Service Data for {sector} using {provider.name}...")
         b1 = self._encode_image(img1_path)
         b2 = self._encode_image(img2_path)
         if not b1 or not b2:
@@ -36,7 +36,7 @@ class Extractor:
         )
 
         payload = {
-            "model": model_name,
+            "model": provider.model,
             "messages": [
                 {
                     "role": "user",
@@ -50,69 +50,87 @@ class Extractor:
             "response_format": {"type": "json_object"},
         }
 
-        resp = self.api.post_chat_completion(payload)
-        if resp:
-            try:
+        try:
+            resp = self.api.post_chat_completion(payload, provider=provider)
+            if resp:
                 content = self.api.clean_json_response(resp["choices"][0]["message"]["content"])
-                data_dict = json.loads(content)
-                # Pydantic Validation
-                return ServiceData(**data_dict)
-            except Exception as e:
-                self.context.log(f"[ERROR] Failed to parse Service Data for {sector}: {e}")
+                try:
+                    data_dict = json.loads(content)
+                    return ServiceData(**data_dict)
+                except Exception as e:
+                    self.context.log(f"[ERROR] Failed to parse Service Data for {sector}: {e}")
+                    self.context.log(f"[DEBUG] Raw Content: {content}")
+            else:
+                self.context.log(f"[ERROR] API Request failed for {sector} service data.")
+        except Exception as e:
+            self.context.log(f"[ERROR] Exception during Service Analysis for {sector}: {e}")
+            
         return None
 
-    def analyze_generic_image(self, image_path: str, model_name: str) -> Dict[str, Any]:
-        """
-        Returns a dict with 'image_type' and 'data'.
-        """
+    def analyze_speed_test(self, image_path: str, provider: LLMProvider) -> Optional[SpeedTestData]:
         name = Path(image_path).stem
-        self.context.log(f"[AI] Analyzing Generic Image: {name}")
+        self.context.log(f"[AI] Analyzing Speed Test Data: {name} using {provider.name}")
         b = self._encode_image(image_path)
-        if not b:
-             return {}
+        if not b: return None
 
         prompt = (
-            "You are an expert AI assistant for analyzing cellular network test data. "
-            "Classify the image as 'speed_test', 'video_test', or 'voice_call' and return a single JSON object "
-            "matching the corresponding schema. Use null for missing fields.\n\n"
-            f"SCHEMAS:\n{json.dumps(GENERIC_SCHEMAS, indent=2)}"
+            "Extract Speed Test data from this screenshot. Return strict JSON matching the schema.\n"
+            f"SCHEMA:\n{json.dumps(SPEED_SCHEMA_JSON, indent=2)}"
         )
+        return self._run_single_image_analysis(name, b, prompt, provider, SpeedTestData)
 
+    def analyze_video_test(self, image_path: str, provider: LLMProvider) -> Optional[VideoTestData]:
+        name = Path(image_path).stem
+        self.context.log(f"[AI] Analyzing Video Test Data: {name} using {provider.name}")
+        b = self._encode_image(image_path)
+        if not b: return None
+
+        prompt = (
+            "Extract Video Test data from this screenshot. Return strict JSON matching the schema.\n"
+            f"SCHEMA:\n{json.dumps(VIDEO_SCHEMA_JSON, indent=2)}"
+        )
+        return self._run_single_image_analysis(name, b, prompt, provider, VideoTestData)
+
+    def analyze_voice_call(self, image_path: str, provider: LLMProvider) -> Optional[VoiceCallData]:
+        name = Path(image_path).stem
+        self.context.log(f"[AI] Analyzing Voice Call Data: {name} using {provider.name}")
+        b = self._encode_image(image_path)
+        if not b: return None
+
+        prompt = (
+            "Extract Voice Call data from this screenshot. Return strict JSON matching the schema.\n"
+            f"SCHEMA:\n{json.dumps(VOICE_SCHEMA_JSON, indent=2)}"
+        )
+        return self._run_single_image_analysis(name, b, prompt, provider, VoiceCallData)
+
+    def _run_single_image_analysis(self, name: str, b64_img: str, prompt: str, provider: LLMProvider, schema_cls):
         payload = {
-            "model": model_name,
+            "model": provider.model,
             "messages": [
                 {
                     "role": "user",
                     "content": [
                         {"type": "text", "text": prompt},
-                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b}"}},
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_img}"}},
                     ],
                 }
             ],
             "response_format": {"type": "json_object"},
         }
-
-        resp = self.api.post_chat_completion(payload)
-        if resp:
-            try:
+        
+        try:
+            resp = self.api.post_chat_completion(payload, provider=provider)
+            if resp:
                 content = self.api.clean_json_response(resp["choices"][0]["message"]["content"])
-                result = json.loads(content)
-                img_type = result.get("image_type")
-                raw_data = result.get("data", {})
-                
-                # Validation
-                if img_type == "speed_test":
-                    validated = SpeedTestData(**raw_data)
-                    return {"image_type": "speed_test", "data": validated}
-                elif img_type == "video_test":
-                    validated = VideoTestData(**raw_data)
-                    return {"image_type": "video_test", "data": validated}
-                elif img_type == "voice_call":
-                    validated = VoiceCallData(**raw_data)
-                    return {"image_type": "voice_call", "data": validated}
-                else:
-                    self.context.log(f"[WARN] Unknown image type '{img_type}' for {name}")
-                    return {}
-            except Exception as e:
-                self.context.log(f"[ERROR] Failed to parse Generic Data for {name}: {e}")
-        return {}
+                try:
+                    data = json.loads(content)
+                    return schema_cls(**data)
+                except Exception as e:
+                    self.context.log(f"[ERROR] JSON Parse Error for {name}: {e}")
+                    self.context.log(f"[DEBUG] Raw Content: {content}")
+            else:
+                 self.context.log(f"[ERROR] API Request failed for {name}")
+        except Exception as e:
+            self.context.log(f"[ERROR] Exception during analysis of {name}: {e}")
+            
+        return None
