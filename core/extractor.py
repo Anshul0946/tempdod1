@@ -1,203 +1,207 @@
 import base64
 import json
-import time
+import requests
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional
 from .config import (
     ProcessingContext, ServiceData, SpeedTestData, VideoTestData, VoiceCallData,
-    SERVICE_SCHEMA_JSON, SPEED_SCHEMA_JSON, VIDEO_SCHEMA_JSON, VOICE_SCHEMA_JSON, LLMProvider
+    SERVICE_SCHEMA_JSON, SPEED_SCHEMA_JSON, VIDEO_SCHEMA_JSON, VOICE_SCHEMA_JSON, 
+    LLMProvider, OCR_URL
 )
 from .api_manager import APIManager
 
-# ==================== DOMAIN-SPECIFIC PROMPTS ====================
+# ==================== REASONING PROMPTS (Strict JSON) ====================
 
-PROMPT_OCR = """You are an expert OCR assistant. Read and extract ALL text visible in this image.
-Return every piece of text you can see, including numbers, labels, values, and any UI elements.
-Be thorough - do not miss any text. Just read and return all text, nothing else."""
+PROMPT_SERVICE = """Parse this OCR text from a cellular network info screen into JSON:
 
-PROMPT_REASONING_SERVICE = """You are an expert 5G/LTE cellular network engineer.
-Parse the following raw text into JSON matching the schema EXACTLY.
+{
+    "nr_arfcn": <number>,
+    "nr_band": <number>,
+    "nr_pci": <number>,
+    "nr_bw": <number>,
+    "nr5g_rsrp": <number, negative like -85>,
+    "nr5g_rsrq": <number, negative>,
+    "nr5g_sinr": <number>,
+    "lte_band": <number>,
+    "lte_earfcn": <number>,
+    "lte_pci": <number>,
+    "lte_bw": <number>,
+    "lte_rsrp": <number, negative>,
+    "lte_rsrq": <number, negative>,
+    "lte_sinr": <number>
+}
 
-RULES:
-- Extract numeric values only (no units like 'dBm' or 'MHz')
-- RSRP is typically negative (-50 to -140 dBm)
-- SINR can be positive or negative
-- If a value is not clearly present, use 0 instead of null
-- Do NOT hallucinate - only extract values that are clearly visible in the text
+Extract numeric values only. Return ONLY the JSON."""
 
-Return ONLY the JSON object, no explanation."""
+PROMPT_SPEED = """Parse this OCR text from a speed test screen into JSON:
 
-PROMPT_REASONING_SPEED = """You are a network performance expert.
-Parse this speed test data into JSON matching the schema EXACTLY.
+{
+    "download_mbps": <number>,
+    "upload_mbps": <number>,
+    "ping_ms": <number>,
+    "jitter_ms": <number>
+}
 
-RULES:
-- Download/Upload values should be in Mbps (numeric only)
-- Ping/Latency should be in ms (numeric only)
-- Jitter should be in ms (numeric only)
-- If a value appears as text like "363 Mbps", extract just the number 363
-- If a value is not found, use 0 instead of null
+Look for: Download/Upload speeds in Mbps, Ping/Latency in ms, Jitter in ms.
+Return ONLY the JSON."""
 
-Return ONLY the JSON object, no other text."""
+PROMPT_VIDEO = """Parse this OCR text from a video test screen into JSON:
 
-PROMPT_REASONING_VIDEO = """You are a streaming quality expert.
-Parse this video test data into JSON matching the schema EXACTLY.
+{
+    "max_resolution": "<string like 1080p or 4K>",
+    "load_time_ms": <number>,
+    "buffering_percentage": <number>
+}
 
-RULES:
-- Resolution as string (e.g., "1080p", "4K", "720p")
-- Load time in ms (numeric)
-- Buffering as percentage 0-100 (numeric)
-- If a value is not found, use 0 for numbers or "unknown" for strings
+Return ONLY the JSON."""
 
-Return ONLY the JSON object, no other text."""
+PROMPT_VOICE = """Parse this OCR text from a voice call screen into JSON:
 
-PROMPT_REASONING_VOICE = """You are a voice call quality expert.
-Parse this call data into JSON matching the schema EXACTLY.
+{
+    "phone_number": "<string>",
+    "call_duration_seconds": <number>,
+    "call_status": "<string>",
+    "time": "<string>"
+}
 
-RULES:
-- Phone number as string with formatting
-- Duration: convert to seconds if needed (e.g., "1:30" = 90)
-- Status as string
-- Time as string in original format
-- If a value is not found, use 0 for numbers or "unknown" for strings
-
-Return ONLY the JSON object, no other text."""
+If duration is "1:30", convert to 90 seconds.
+Return ONLY the JSON."""
 
 
 class Extractor:
     """
-    Simplified Two-Stage Pipeline:
-    Stage 1: Vision (OCR) - extracts raw text
-    Stage 2: Reasoning - parses into schema with NO NULLS
+    Strict PaddleOCR + Reasoning Pipeline.
+    No fallbacks, no retries - just OCR → Parse.
     """
+    
     def __init__(self, api_manager: APIManager, context: ProcessingContext):
         self.api = api_manager
         self.context = context
 
     def _encode_image(self, path: str) -> Optional[str]:
+        """Encode image to base64."""
         try:
             with open(path, "rb") as f:
                 return base64.b64encode(f.read()).decode("utf-8")
         except Exception as e:
-            self.context.log(f"[ERROR] Could not read image {path}: {e}")
+            self.context.log(f"[ERROR] Cannot read {path}: {e}")
             return None
 
-    def _extract_raw_text(self, image_path: str, vision_provider: LLMProvider) -> Optional[str]:
-        """Stage 1: Vision extracts ALL text from image."""
+    def _paddle_ocr(self, image_path: str, api_key: str) -> Optional[str]:
+        """
+        Call PaddleOCR API to extract text from image.
+        Returns raw OCR text.
+        """
         name = Path(image_path).stem
-        self.context.log(f"[OCR] Reading {name}...")
+        self.context.log(f"[OCR] {name}")
         
-        b64_img = self._encode_image(image_path)
-        if not b64_img:
+        b64 = self._encode_image(image_path)
+        if not b64:
+            return None
+        
+        # Check size limit
+        if len(b64) >= 180000:
+            self.context.log(f"[WARN] {name} too large for OCR")
+            return None
+        
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Accept": "application/json"
+        }
+        
+        payload = {
+            "input": [{
+                "type": "image_url",
+                "url": f"data:image/png;base64,{b64}"
+            }]
+        }
+        
+        try:
+            resp = requests.post(OCR_URL, headers=headers, json=payload, timeout=60)
+            resp.raise_for_status()
+            data = resp.json()
+            
+            # Extract text from PaddleOCR response
+            # Response format: {"data": [{"text": [...]}]}
+            if "data" in data and data["data"]:
+                texts = []
+                for item in data["data"]:
+                    if isinstance(item, dict) and "text" in item:
+                        texts.extend(item["text"])
+                    elif isinstance(item, list):
+                        texts.extend(item)
+                
+                ocr_text = " ".join(str(t) for t in texts if t)
+                self.context.log(f"[OCR] Got {len(ocr_text)} chars")
+                return ocr_text
+            else:
+                self.context.log(f"[OCR] No text found in response")
+                return None
+                
+        except Exception as e:
+            self.context.log(f"[OCR ERROR] {e}")
             return None
 
-        payload = {
-            "model": vision_provider.model,
-            "messages": [{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": PROMPT_OCR},
-                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_img}"}},
-                ],
-            }],
-        }
-
-        try:
-            resp = self.api.post_chat_completion(payload, provider=vision_provider)
-            if resp and "choices" in resp:
-                raw_text = resp["choices"][0]["message"]["content"]
-                self.context.log(f"[OCR] Got {len(raw_text)} chars")
-                return raw_text
-        except Exception as e:
-            self.context.log(f"[OCR ERROR] {name}: {e}")
+    def _reasoning_parse(self, text: str, prompt: str, schema_cls, 
+                          reasoning_provider: LLMProvider):
+        """Parse OCR text using reasoning model."""
+        self.context.log(f"[PARSE] Reasoning...")
         
-        return None
-
-    def _parse_with_reasoning(self, raw_text: str, schema_json: dict, schema_cls, 
-                               reasoning_provider: LLMProvider, reasoning_prompt: str):
-        """Stage 2: Reasoning parses text into schema."""
-        self.context.log(f"[PARSE] Reasoning model parsing...")
-        
-        prompt = f"{reasoning_prompt}\n\nSCHEMA:\n{json.dumps(schema_json, indent=2)}\n\nRAW TEXT:\n{raw_text}"
+        full_prompt = f"{prompt}\n\nOCR TEXT:\n{text}"
         
         try:
-            json_str = self.api.post_reasoning_completion(prompt, reasoning_provider)
+            json_str = self.api.post_reasoning_completion(full_prompt, reasoning_provider)
             if json_str:
                 data = json.loads(json_str)
                 result = schema_cls(**data)
-                self.context.log(f"[PARSE] Success")
-                return result
                 
+                # Log nulls
+                nulls = [k for k, v in data.items() if v is None]
+                if nulls:
+                    self.context.log(f"[WARN] Nulls: {nulls}")
+                else:
+                    self.context.log(f"[OK] All fields parsed")
+                return result
         except Exception as e:
             self.context.log(f"[PARSE ERROR] {e}")
-        
         return None
 
-    # ==================== SERVICE ANALYSIS ====================
-    def analyze_service_images(self, sector: str, img1_path: str, img2_path: str, 
-                                vision_provider: LLMProvider, reasoning_provider: LLMProvider) -> Optional[ServiceData]:
-        """Service: OCR both images → Reasoning merges."""
-        self.context.log(f"[SERVICE] {sector.upper()} - 2 images")
+    # ==================== SERVICE (2 images) ====================
+    def analyze_service_images(self, sector: str, img1: str, img2: str,
+                                vision_provider: LLMProvider,  # Contains API key
+                                reasoning_provider: LLMProvider) -> Optional[ServiceData]:
+        self.context.log(f"--- {sector.upper()} SERVICE ---")
         
-        text1 = self._extract_raw_text(img1_path, vision_provider)
-        time.sleep(0.3)
-        text2 = self._extract_raw_text(img2_path, vision_provider)
+        t1 = self._paddle_ocr(img1, vision_provider.api_key)
+        t2 = self._paddle_ocr(img2, vision_provider.api_key)
         
-        if not text1 and not text2:
-            self.context.log(f"[SERVICE ERROR] No text for {sector}")
+        if not t1 and not t2:
+            self.context.log(f"[ERROR] No OCR text for {sector}")
             return None
         
-        combined = f"=== IMAGE 1 ===\n{text1 or 'No data'}\n\n=== IMAGE 2 ===\n{text2 or 'No data'}"
-        result = self._parse_with_reasoning(combined, SERVICE_SCHEMA_JSON, ServiceData, 
-                                            reasoning_provider, PROMPT_REASONING_SERVICE)
-        
-        if result:
-            self.context.log(f"[SERVICE OK] {sector}")
-        return result
+        combined = f"IMAGE 1: {t1 or 'empty'}\nIMAGE 2: {t2 or 'empty'}"
+        return self._reasoning_parse(combined, PROMPT_SERVICE, ServiceData, reasoning_provider)
 
-    # ==================== SPEED TEST ====================
-    def analyze_speed_test(self, image_path: str, vision_provider: LLMProvider, 
+    # ==================== SPEED ====================
+    def analyze_speed_test(self, img: str, vision_provider: LLMProvider,
                            reasoning_provider: LLMProvider) -> Optional[SpeedTestData]:
-        """Speed: OCR → Reasoning."""
-        name = Path(image_path).stem
-        
-        raw_text = self._extract_raw_text(image_path, vision_provider)
-        if not raw_text:
+        text = self._paddle_ocr(img, vision_provider.api_key)
+        if not text:
             return None
-        
-        result = self._parse_with_reasoning(raw_text, SPEED_SCHEMA_JSON, SpeedTestData,
-                                            reasoning_provider, PROMPT_REASONING_SPEED)
-        if result:
-            self.context.log(f"[SPEED OK] {name}")
-        return result
+        return self._reasoning_parse(text, PROMPT_SPEED, SpeedTestData, reasoning_provider)
 
-    # ==================== VIDEO TEST ====================
-    def analyze_video_test(self, image_path: str, vision_provider: LLMProvider,
+    # ==================== VIDEO ====================
+    def analyze_video_test(self, img: str, vision_provider: LLMProvider,
                            reasoning_provider: LLMProvider) -> Optional[VideoTestData]:
-        """Video: OCR → Reasoning."""
-        name = Path(image_path).stem
-        
-        raw_text = self._extract_raw_text(image_path, vision_provider)
-        if not raw_text:
+        text = self._paddle_ocr(img, vision_provider.api_key)
+        if not text:
             return None
-        
-        result = self._parse_with_reasoning(raw_text, VIDEO_SCHEMA_JSON, VideoTestData,
-                                            reasoning_provider, PROMPT_REASONING_VIDEO)
-        if result:
-            self.context.log(f"[VIDEO OK] {name}")
-        return result
+        return self._reasoning_parse(text, PROMPT_VIDEO, VideoTestData, reasoning_provider)
 
-    # ==================== VOICE CALL ====================
-    def analyze_voice_call(self, image_path: str, vision_provider: LLMProvider,
+    # ==================== VOICE ====================
+    def analyze_voice_call(self, img: str, vision_provider: LLMProvider,
                            reasoning_provider: LLMProvider) -> Optional[VoiceCallData]:
-        """Voice: OCR → Reasoning."""
-        name = Path(image_path).stem
-        
-        raw_text = self._extract_raw_text(image_path, vision_provider)
-        if not raw_text:
+        text = self._paddle_ocr(img, vision_provider.api_key)
+        if not text:
             return None
-        
-        result = self._parse_with_reasoning(raw_text, VOICE_SCHEMA_JSON, VoiceCallData,
-                                            reasoning_provider, PROMPT_REASONING_VOICE)
-        if result:
-            self.context.log(f"[VOICE OK] {name}")
-        return result
+        return self._reasoning_parse(text, PROMPT_VOICE, VoiceCallData, reasoning_provider)
